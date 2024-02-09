@@ -1,4 +1,8 @@
-use std::{io::Write, net::TcpStream, time::Duration};
+use std::{
+    io::{Read, Write},
+    net::TcpStream,
+    time::Duration,
+};
 
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -12,10 +16,11 @@ enum Command {
     Boot,
 }
 
-enum BootloaderResponse {
+#[derive(Debug, Serialize, Deserialize)]
+pub enum BootloadError {
     Success,
     InvalidAddress,
-    LengthNotMultipleOf32,
+    LengthNotMultiple32,
     LengthTooLong,
     DataLengthIncorrect,
     EraseError,
@@ -53,7 +58,7 @@ struct Cli {
     chunk_size: usize,
 
     /// Timeout for socket operations, default 5s
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 20)]
     timeout: u64,
 
     #[command(subcommand)]
@@ -96,6 +101,7 @@ enum Commands {
 
     /// Send immediate reboot request
     Boot,
+    Erase,
 }
 
 struct Client {
@@ -119,6 +125,12 @@ impl Client {
         let len = binfile.len();
         let padding = if len % 32 == 0 { 0 } else { 32 - (len % 32) };
         binfile.resize(len + padding, 0xFF);
+        let segments = binfile.chunks(chunk_size as usize);
+        let segments = segments.len();
+
+        println!("Erasing flash sector");
+        self.erase_flash(0x08010000, len as u32)?;
+        println!("Erased");
 
         self.socket.write_all(&binfile)?;
         Ok(())
@@ -128,7 +140,20 @@ impl Client {
         let cmd = Command::Erase { address, length };
         let cmd = postcard::to_stdvec(&cmd).expect("Failed to serialize erase command");
         self.socket.write_all(&cmd)?;
+
+        //Just block for now as we only do one op at a time
+        self.socket.set_nonblocking(false)?;
+        println!("{:?} erasing the flash", self.get_reply().unwrap());
+
         Ok(())
+    }
+
+    fn get_reply(&mut self) -> Result<BootloadError, std::io::Error> {
+        let mut buf = [0; 1];
+        self.socket.read_exact(&mut buf)?;
+        postcard::from_bytes(&buf).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::Other, "Failed to deserialize error")
+        })
     }
 }
 
@@ -172,6 +197,11 @@ fn main() {
                 .socket
                 .write_all(&cmd)
                 .expect("Failed to send boot command");
+        }
+        Commands::Erase => {
+            client
+                .erase_flash(0x08010000, 0x1000)
+                .expect("Failed to send erase command");
         }
     }
 }
