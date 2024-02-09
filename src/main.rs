@@ -1,6 +1,7 @@
 use std::{
     io::{Read, Write},
     net::TcpStream,
+    path::PathBuf,
     time::Duration,
 };
 
@@ -8,11 +9,11 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
-enum Command {
+enum Command<'a> {
     Info,
     Read,
     Erase { address: u32, length: u32 },
-    Write,
+    Write { data: &'a [u8] },
     Boot,
 }
 
@@ -58,7 +59,7 @@ struct Cli {
     chunk_size: usize,
 
     /// Timeout for socket operations, default 5s
-    #[arg(long, default_value_t = 20)]
+    #[arg(long, default_value_t = 200)]
     timeout: u64,
 
     #[command(subcommand)]
@@ -73,11 +74,11 @@ enum Commands {
     /// Bootload new firmware image
     Program {
         /// Address to load to, default 0x08010000
-        #[arg(long, default_value = "0x08010000")]
-        lma: String,
+        #[arg(long, default_value_t = 0x08010000)]
+        lma: u64,
 
         /// Raw binary file to program
-        binfile: Vec<u8>,
+        binfile: PathBuf,
     },
 
     /// Load new configuration
@@ -113,26 +114,39 @@ impl Client {
         let socket = TcpStream::connect((hostname, port))?;
         socket.set_read_timeout(Some(Duration::from_secs(timeout)))?;
         socket.set_write_timeout(Some(Duration::from_secs(timeout)))?;
+        //Just block for now as we only do one op at a time
+        socket.set_nonblocking(false)?;
+
         Ok(Self { socket })
     }
 
     fn send_program_request(
         &mut self,
-        lma: &str,
-        mut binfile: Vec<u8>,
+        lma: u64,
+        binfile: PathBuf,
         chunk_size: u64,
     ) -> Result<(), std::io::Error> {
+        let mut binfile = std::fs::read(binfile).expect("Failed to read binfile");
+
         let len = binfile.len();
         let padding = if len % 32 == 0 { 0 } else { 32 - (len % 32) };
         binfile.resize(len + padding, 0xFF);
         let segments = binfile.chunks(chunk_size as usize);
-        let segments = segments.len();
 
         println!("Erasing flash sector");
         self.erase_flash(0x08010000, len as u32)?;
-        println!("Erased");
 
-        self.socket.write_all(&binfile)?;
+        let segments_len = segments.len();
+        for (i, segment) in segments.into_iter().enumerate() {
+            println!(
+                "Writing segment(size={}) {} of {}",
+                segment.len(),
+                i,
+                segments_len
+            );
+            self.write_flash(segment)?;
+        }
+
         Ok(())
     }
 
@@ -141,19 +155,28 @@ impl Client {
         let cmd = postcard::to_stdvec(&cmd).expect("Failed to serialize erase command");
         self.socket.write_all(&cmd)?;
 
-        //Just block for now as we only do one op at a time
-        self.socket.set_nonblocking(false)?;
         println!("{:?} erasing the flash", self.get_reply().unwrap());
 
         Ok(())
     }
 
     fn get_reply(&mut self) -> Result<BootloadError, std::io::Error> {
-        let mut buf = [0; 1];
-        self.socket.read_exact(&mut buf)?;
+        let mut buf = vec![0; 4];
+        self.socket.read_to_end(&mut buf)?;
         postcard::from_bytes(&buf).map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::Other, "Failed to deserialize error")
         })
+    }
+
+    fn write_flash(&mut self, data: &[u8]) -> Result<(), std::io::Error> {
+        let cmd = Command::Write { data };
+        let cmd = postcard::to_stdvec(&cmd).expect("Failed to serialize write command");
+        println!("Writing {} bytes to the socket", cmd.len());
+        self.socket.write_all(&cmd)?;
+
+        println!("Writing status: {:?}", self.get_reply()?);
+
+        Ok(())
     }
 }
 
@@ -173,7 +196,7 @@ fn main() {
         }
         Commands::Program { lma, binfile } => {
             client
-                .send_program_request(&lma, binfile, args.chunk_size as u64)
+                .send_program_request(lma, binfile, args.chunk_size as u64)
                 .expect("Failed to send program request");
         }
         Commands::Configure {
@@ -183,12 +206,12 @@ fn main() {
             gateway_address,
             prefix_length,
         } => {
-            let cmd = Command::Write;
-            let cmd = postcard::to_stdvec(&cmd).expect("Failed to serialize write command");
-            client
-                .socket
-                .write_all(&cmd)
-                .expect("Failed to send write command");
+            //let cmd = Command::Write;
+            //let cmd = postcard::to_stdvec(&cmd).expect("Failed to serialize write command");
+            //client
+            //    .socket
+            //    .write_all(&cmd)
+            //    .expect("Failed to send write command");
         }
         Commands::Boot => {
             let cmd = Command::Boot;
